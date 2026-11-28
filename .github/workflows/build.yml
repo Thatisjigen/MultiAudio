@@ -1,0 +1,53 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macos
+          - os: windows-latest
+            name: windows
+          - os: ubuntu-latest
+            name: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libpulse-dev libxkbcommon-dev
+      - name: Test
+        run: cargo test --release
+      - name: Package (macOS, universal)
+        if: runner.os == 'macOS'
+        run: |
+          ./packaging/macos/make-app.sh --universal
+          cd dist && zip -r ../MultiAudio-macos.zip MultiAudio.app
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo build --release
+          cp target/release/multiaudio.exe MultiAudio.exe
+          7z a MultiAudio-windows.zip MultiAudio.exe README.md LICENSE
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release
+          mkdir -p MultiAudio && cp target/release/multiaudio README.md LICENSE MultiAudio/
+          cp assets/icon.png MultiAudio/multiaudio.png && cp packaging/linux/multiaudio.desktop MultiAudio/
+          tar czf MultiAudio-linux.tar.gz MultiAudio
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MultiAudio-${{ matrix.name }}
+          path: |
+            MultiAudio-*.zip
+            MultiAudio-*.tar.gz

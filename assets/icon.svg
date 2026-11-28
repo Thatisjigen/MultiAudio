@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- MultiAudio: one source split into several aligned outputs.
+       Drawn on the macOS icon grid (824 px tile with 100 px margin).
+       All joins are tangent-continuous: the source reaches the fork flat (at
+       a crest), each branch leaves it flat and rises/falls straight into a
+       crest/trough of its output wave. -->
+  <g transform="translate(100 100) scale(0.8046875)">
+    <rect width="1024" height="1024" rx="230" fill="#141821"/>
+    <g transform="translate(12 0)" fill="none" stroke-width="42" stroke-linecap="round" stroke-linejoin="round">
+      <path stroke="#2ECC9A" d="M520 512 C590 512 590 336 660 336 C685.2 336 704.8 424 730 424 C755.2 424 774.8 336 800 336 C825.2 336 844.8 424 870 424"/>
+      <path stroke="#8B6CFF" d="M520 512 C590 512 590 688 660 688 C685.2 688 704.8 600 730 600 C755.2 600 774.8 688 800 688 C825.2 688 844.8 600 870 600"/>
+      <path stroke="#FFFFFF" d="M115 566 C148.3 494.2 171.7 494.2 205 566 C238.3 637.8 261.7 637.8 295 566 C328.3 494.2 351.7 494.2 385 566 C418.3 637.8 441.7 637.8 475 566 C483.2 540.9 505 512 520 512"/>
+      <circle cx="870" cy="424" r="36" fill="#2ECC9A"/>
+      <circle cx="870" cy="600" r="36" fill="#8B6CFF"/>
+    </g>
+  </g>
+</svg>

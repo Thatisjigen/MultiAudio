@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=MultiAudio
+Comment=Audio del computer su più uscite, sincronizzate tra loro e col video
+Exec=multiaudio
+Icon=multiaudio
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;

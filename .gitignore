@@ -1,0 +1,5 @@
+target/
+dist/
+*.json.tmp
+.DS_Store
+src/local_tests/
