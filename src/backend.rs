@@ -238,9 +238,14 @@ pub fn list_devices() -> DeviceList {
         list.outputs.extend(o);
     }
 
+    // Linux with PipeWire / PulseAudio: every sound card is already listed
+    // above as one of its sinks and sources. The raw ALSA devices would only
+    // repeat them (and opening one directly fights with the sound server),
+    // so they are listed only when there is no sound server.
+    let skip_alsa = cfg!(target_os = "linux") && !list.outputs.is_empty();
     let host = cpal::default_host();
     let prefix = if cfg!(target_os = "linux") { "ALSA · " } else { "" };
-    if let Ok(devs) = host.devices() {
+    if let Ok(devs) = if skip_alsa { Err(()) } else { host.devices().map_err(|_| ()) } {
         for d in devs {
             let Ok(id) = d.id() else { continue };
             if id.to_string().contains("app.multiaudio.") {
@@ -443,8 +448,10 @@ pub const VOUT_INPUT: &str = "pulse:multiaudio_51.monitor";
 #[cfg(not(target_os = "linux"))]
 pub const VOUT_INPUT: &str = "tap:out";
 
-/// MultiAudio's own output is the system output (macOS).
-pub const VOUT_IS_SYSTEM: bool = cfg!(target_os = "macos");
+/// MultiAudio's own output is the system output (macOS; Linux: see
+/// `linux_vout`): every app plays to it and MultiAudio plays every output,
+/// each with its position and delay.
+pub const VOUT_IS_SYSTEM: bool = cfg!(any(target_os = "macos", target_os = "linux"));
 
 /// Output id of MultiAudio's own output.
 pub fn vout_output_id() -> String {
@@ -463,7 +470,7 @@ pub enum VirtualOut {
     #[cfg(target_os = "macos")]
     Mac(crate::mactap::VirtualOut, bool),
     #[cfg(target_os = "linux")]
-    Linux(u32),
+    Linux(linux_vout::Out),
 }
 
 impl VirtualOut {
@@ -483,6 +490,11 @@ impl VirtualOut {
         if let VirtualOut::Mac(v, _) = self {
             return Some((v.declared_ms as f32, v.floor_ms as f32));
         }
+        #[cfg(target_os = "linux")]
+        #[allow(irrefutable_let_patterns)] // the only variant on Linux
+        if let VirtualOut::Linux(linux_vout::Out::Loopback { declared_ms }) = self {
+            return Some((*declared_ms, 0.0));
+        }
         None
     }
 }
@@ -491,8 +503,8 @@ impl Drop for VirtualOut {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
         #[allow(irrefutable_let_patterns)] // the only variant on Linux
-        if let VirtualOut::Linux(module) = self {
-            let _ = std::process::Command::new("pactl").args(["unload-module", &module.to_string()]).status();
+        if let VirtualOut::Linux(out) = self {
+            linux_vout::remove(out);
         }
         #[cfg(target_os = "macos")]
         #[allow(irrefutable_let_patterns)] // the only variant on macOS
@@ -719,20 +731,8 @@ pub fn create_vout(devs: &DeviceList, members: &[String], latency_ms: f32, main:
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = (devs, members, latency_ms, main);
-        let out = std::process::Command::new("pactl")
-            .args([
-                "load-module",
-                "module-null-sink",
-                "sink_name=multiaudio_51",
-                "channels=6",
-                "channel_map=front-left,front-right,front-center,lfe,rear-left,rear-right",
-                "sink_properties=device.description=MultiAudio_5.1",
-            ])
-            .output()?;
-        let module: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().map_err(|_| anyhow!("pactl load-module non riuscito"))?;
-        crate::diag::log("uscita «MultiAudio 5.1» creata (sink PipeWire a 6 canali)");
-        return Ok(VirtualOut::Linux(module));
+        let _ = (devs, members, main);
+        return linux_vout::create(latency_ms).map(VirtualOut::Linux);
     }
     #[allow(unreachable_code)]
     {
@@ -746,17 +746,7 @@ pub fn cleanup_vout() {
     #[cfg(target_os = "macos")]
     crate::mactap::destroy_stale();
     #[cfg(target_os = "linux")]
-    {
-        if let Ok(o) = std::process::Command::new("pactl").args(["list", "short", "modules"]).output() {
-            for line in String::from_utf8_lossy(&o.stdout).lines() {
-                if line.contains("sink_name=multiaudio_51") {
-                    if let Some(idx) = line.split_whitespace().next() {
-                        let _ = std::process::Command::new("pactl").args(["unload-module", idx]).status();
-                    }
-                }
-            }
-        }
-    }
+    linux_vout::cleanup();
 }
 
 /// Puts the system output back and removes our output: for a panic or a
@@ -764,6 +754,281 @@ pub fn cleanup_vout() {
 pub fn emergency_restore() {
     #[cfg(target_os = "macos")]
     crate::mactap::emergency_restore();
+    #[cfg(target_os = "linux")]
+    linux_vout::emergency_restore();
+}
+
+/// Linux: MultiAudio's own output, the system output while it runs.
+///
+/// It must declare how late the sound comes out of the speakers, or players
+/// do not delay the picture. A PipeWire virtual sink cannot: on 2026-11-28
+/// `ProcessLatency`, `latency.internal.ns` and `latencyOffsetNsec` on a null
+/// sink all left what clients see at the buffer alone. The latency offset of
+/// a sound card's port does reach them, so the output is the kernel's
+/// loopback card (snd-aloop), whose sink a WirePlumber rule names
+/// `multiaudio_51` (README); its port declares the latency. Without that
+/// card it is a null sink as before, which declares nothing.
+#[cfg(target_os = "linux")]
+pub mod linux_vout {
+    use anyhow::{anyhow, Result};
+    use std::process::Command;
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    use std::time::Duration;
+
+    pub const SINK: &str = "multiaudio_51";
+    const CARD: &str = "alsa_card.platform-snd_aloop.0";
+    const PROFILE: &str = "output:analog-surround-51";
+
+    /// This process made MultiAudio's output (and must give the system
+    /// output back when it goes).
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+    pub enum Out {
+        /// The loopback card, declaring this latency (ms).
+        Loopback { declared_ms: f32 },
+        /// A null sink (its module): declares nothing.
+        Null(u32),
+    }
+
+    fn pactl(args: &[&str]) -> Option<String> {
+        let o = Command::new("pactl").args(args).env("LC_ALL", "C").output().ok()?;
+        o.status.success().then(|| String::from_utf8_lossy(&o.stdout).to_string())
+    }
+
+    /// Names in `pactl list short <kind>` (second column).
+    fn short_names(kind: &str) -> Vec<String> {
+        pactl(&["list", "short", kind])
+            .map(|s| s.lines().filter_map(|l| l.split('\t').nth(1)).map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    fn sink_exists(name: &str) -> bool {
+        short_names("sinks").iter().any(|s| s == name)
+    }
+
+    fn card_exists() -> bool {
+        short_names("cards").iter().any(|c| c == CARD)
+    }
+
+    /// The loopback card's output port: its latency offset is what players see.
+    fn port() -> Option<String> {
+        let text = pactl(&["list", "cards"])?;
+        let (mut in_card, mut in_ports) = (false, false);
+        for line in text.lines() {
+            if line.starts_with("Card #") {
+                (in_card, in_ports) = (false, false);
+                continue;
+            }
+            let t = line.trim();
+            if let Some(n) = t.strip_prefix("Name: ") {
+                in_card = n == CARD;
+                continue;
+            }
+            if !in_card {
+                continue;
+            }
+            if line == "\tPorts:" {
+                in_ports = true;
+            } else if in_ports && line.starts_with("\t\t") && !line.starts_with("\t\t\t") {
+                if let Some((name, _)) = t.split_once(':') {
+                    if name.contains("output") {
+                        return Some(name.to_string());
+                    }
+                }
+            } else if !line.starts_with("\t\t") {
+                in_ports = false;
+            }
+        }
+        None
+    }
+
+    fn active_profile() -> Option<String> {
+        let text = pactl(&["list", "cards"])?;
+        let mut in_card = false;
+        for line in text.lines() {
+            let t = line.trim();
+            if let Some(n) = t.strip_prefix("Name: ") {
+                in_card = n == CARD;
+            } else if in_card {
+                if let Some(p) = t.strip_prefix("Active Profile: ") {
+                    return Some(p.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Makes «MultiAudio» the system output, and checks it stays so: while
+    /// a sink is being made again WirePlumber picks another output for a
+    /// moment (2026-11-28: the Bluetooth speaker, which then stayed).
+    fn make_default() {
+        for _ in 0..3 {
+            let _ = Command::new("pactl").args(["set-default-sink", SINK]).status();
+            std::thread::sleep(Duration::from_millis(400));
+            if default_sink().as_deref() == Some(SINK) {
+                return;
+            }
+        }
+        crate::diag::log(format!("! «MultiAudio» non resta l'uscita di sistema (ora: {})", default_sink().unwrap_or_default()));
+    }
+
+    fn set_latency(ms: f32) -> bool {
+        let Some(port) = port() else { return false };
+        let us = (ms.max(0.0) as f64 * 1000.0).round() as i64;
+        Command::new("pactl")
+            .args(["set-port-latency-offset", CARD, &port, &us.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn default_sink() -> Option<String> {
+        pactl(&["get-default-sink"]).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    }
+
+    fn is_ours(sink: &str) -> bool {
+        sink == SINK || sink.contains("snd_aloop")
+    }
+
+    /// The system output before MultiAudio's (kept on disk: a crash must
+    /// not leave the system playing into MultiAudio's output).
+    fn previous_file() -> std::path::PathBuf {
+        crate::config::Config::path().with_file_name("uscita-precedente")
+    }
+
+    /// Gives the system output back, if it is still MultiAudio's.
+    fn give_back() {
+        if !default_sink().is_some_and(|d| is_ours(&d)) {
+            return;
+        }
+        let sinks = short_names("sinks");
+        let saved = std::fs::read_to_string(previous_file()).ok().map(|s| s.trim().to_string());
+        let target = saved
+            .filter(|p| sinks.contains(p) && !is_ours(p))
+            .or_else(|| sinks.iter().find(|s| !is_ours(s)).cloned());
+        if let Some(t) = target {
+            let _ = Command::new("pactl").args(["set-default-sink", &t]).status();
+            crate::diag::log(format!("uscita di sistema rimessa: {t}"));
+        }
+    }
+
+    /// Makes MultiAudio's output, declaring `latency_ms`, and makes it the
+    /// system output.
+    pub fn create(latency_ms: f32) -> Result<Out> {
+        if let Some(cur) = default_sink().filter(|d| !is_ours(d)) {
+            let _ = std::fs::write(previous_file(), cur);
+        }
+        let mut out = None;
+        if card_exists() {
+            // (setting it again makes the sink again: only when needed)
+            if active_profile().as_deref() != Some(PROFILE) {
+                let _ = Command::new("pactl").args(["set-card-profile", CARD, PROFILE]).status();
+            }
+            for _ in 0..30 {
+                if sink_exists(SINK) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if sink_exists(SINK) {
+                if !set_latency(latency_ms) {
+                    crate::diag::log("! latenza dell'uscita MultiAudio non impostata (porta della scheda loopback non trovata)");
+                }
+                crate::diag::log(format!("uscita «MultiAudio» (scheda loopback, 5.1): dichiara {latency_ms:.0} ms"));
+                out = Some(Out::Loopback { declared_ms: latency_ms });
+            } else {
+                crate::diag::log(format!("! scheda loopback senza l'uscita «{SINK}»: manca la regola di WirePlumber (README); uso un'uscita semplice"));
+            }
+        }
+        let out = match out {
+            Some(o) => o,
+            None => {
+                let o = Command::new("pactl")
+                    .args([
+                        "load-module",
+                        "module-null-sink",
+                        &format!("sink_name={SINK}"),
+                        "channels=6",
+                        "channel_map=front-left,front-right,front-center,lfe,rear-left,rear-right",
+                        "sink_properties=device.description=MultiAudio",
+                    ])
+                    .output()?;
+                let module: u32 = String::from_utf8_lossy(&o.stdout).trim().parse().map_err(|_| anyhow!("pactl load-module non riuscito"))?;
+                crate::diag::log("uscita «MultiAudio» (sink PipeWire a 6 canali): senza la scheda loopback non dichiara la latenza, il video può andare avanti all'audio");
+                Out::Null(module)
+            }
+        };
+        make_default();
+        ACTIVE.store(true, Relaxed);
+        Ok(out)
+    }
+
+    pub fn remove(out: &Out) {
+        give_back();
+        match out {
+            Out::Loopback { .. } => {
+                set_latency(0.0);
+            }
+            Out::Null(module) => {
+                let _ = Command::new("pactl").args(["unload-module", &module.to_string()]).status();
+            }
+        }
+        ACTIVE.store(false, Relaxed);
+    }
+
+    /// Leftovers of a run that did not end well.
+    pub fn cleanup() {
+        if let Some(mods) = pactl(&["list", "short", "modules"]) {
+            for line in mods.lines() {
+                if line.contains(&format!("sink_name={SINK}")) {
+                    if let Some(idx) = line.split_whitespace().next() {
+                        let _ = Command::new("pactl").args(["unload-module", idx]).status();
+                    }
+                }
+            }
+        }
+        give_back();
+        if card_exists() {
+            set_latency(0.0);
+        }
+    }
+
+    /// Volume of a sink: (slider 0..1, muted). PipeWire's slider is on a
+    /// cubic curve (50 % ≈ −18 dB), like MultiAudio's own.
+    pub fn sink_volume(name: &str) -> Option<(f32, bool)> {
+        let vol = pactl(&["get-sink-volume", name])?;
+        // "Volume: front-left: 32768 /  50% / -18.06 dB,   front-right: ..."
+        let pct: f32 = vol.split('/').nth(1).and_then(|p| p.trim().trim_end_matches('%').parse().ok())?;
+        let muted = pactl(&["get-sink-mute", name]).is_some_and(|m| m.contains("yes"));
+        Some(((pct / 100.0).max(0.0), muted))
+    }
+
+    pub fn set_sink_volume(name: &str, level: f32) -> bool {
+        let pct = format!("{:.0}%", (level.clamp(0.0, 1.0) * 100.0).round());
+        Command::new("pactl").args(["set-sink-volume", name, &pct]).status().is_ok_and(|s| s.success())
+    }
+
+    /// The volume of «MultiAudio» itself (what the volume keys and the
+    /// desktop's slider move while it is the system output).
+    pub fn volume() -> Option<(f32, bool)> {
+        sink_volume(SINK).map(|(l, m)| (l.min(1.0), m))
+    }
+
+    pub fn set_volume(level: f32, muted: bool) {
+        set_sink_volume(SINK, level);
+        let _ = Command::new("pactl").args(["set-sink-mute", SINK, if muted { "1" } else { "0" }]).status();
+    }
+
+    /// A crash or a signal: what `remove` would have done, if this process
+    /// had made the output.
+    pub fn emergency_restore() {
+        if ACTIVE.swap(false, Relaxed) {
+            give_back();
+            if card_exists() {
+                set_latency(0.0);
+            }
+        }
+    }
 }
 
 /// Pids of the processes that are playing sound now, when the system tells
@@ -781,6 +1046,8 @@ pub fn playing_processes() -> Option<Vec<i32>> {
 pub fn system_output_is_vout() -> bool {
     #[cfg(target_os = "macos")]
     return crate::mactap::default_output_uid().as_deref() == Some(crate::mactap::VOUT_UID);
+    #[cfg(target_os = "linux")]
+    return default_output_id().as_deref() == Some(vout_output_id().as_str());
     #[allow(unreachable_code)]
     false
 }
@@ -792,6 +1059,12 @@ pub fn output_volume(id: &str) -> Option<(f32, f32)> {
         let v = crate::mactap::volume_of(uid)?;
         return v.scalar.map(|s| (s, if v.gain.is_finite() { v.gain.clamp(0.0, 1.0) } else { s * s * s }));
     }
+    // Linux: every PipeWire sink has a volume (Bluetooth: the speaker's own)
+    #[cfg(target_os = "linux")]
+    if let Some(name) = id.strip_prefix("pulse:").filter(|_| !is_own_device(id)) {
+        let s = linux_vout::sink_volume(name)?.0.clamp(0.0, 1.0);
+        return Some((s, s * s * s));
+    }
     let _ = id;
     None
 }
@@ -801,6 +1074,10 @@ pub fn set_output_volume(id: &str, scalar: f32) -> bool {
     #[cfg(target_os = "macos")]
     if let Some(uid) = id.strip_prefix("cpal:coreaudio:") {
         return crate::mactap::set_volume(uid, scalar);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(name) = id.strip_prefix("pulse:").filter(|_| !is_own_device(id)) {
+        return linux_vout::set_sink_volume(name, scalar);
     }
     let _ = (id, scalar);
     false
@@ -1282,6 +1559,35 @@ pub mod pulse {
         desc: String,
         channels: usize,
         rate: u32,
+        /// `device.api` (alsa, bluez5, …)
+        api: String,
+        /// `api.bluez5.path`: the Bluetooth device in BlueZ
+        bluez_path: Option<String>,
+    }
+
+    /// Wired outputs: PipeWire tells its clients nothing about the latency
+    /// of a sound card (2026-11-28), so a typical one: about one quantum
+    /// (1024 frames at 48 kHz). The calibration measures the real one.
+    const ALSA_LATENCY_MS: f32 = 20.0;
+
+    /// The delay a Bluetooth device reports for its audio (A2DP delay
+    /// reporting, `org.bluez.MediaTransport1.Delay`, in tenths of a ms):
+    /// what macOS would declare for it. PipeWire does not pass it on.
+    fn bluez_delay_ms(device_path: &str) -> Option<f32> {
+        let run = |args: &[&str]| -> Option<String> {
+            let o = std::process::Command::new("busctl").args(args).output().ok()?;
+            o.status.success().then(|| String::from_utf8_lossy(&o.stdout).to_string())
+        };
+        let tree = run(&["--system", "tree", "--list", "org.bluez"])?;
+        tree.lines()
+            .map(str::trim)
+            .filter(|p| p.starts_with(device_path) && p.contains("/sep") && p.contains("/fd"))
+            .filter_map(|p| {
+                let v = run(&["--system", "get-property", "org.bluez", p, "org.bluez.MediaTransport1", "Delay"])?;
+                v.split_whitespace().nth(1)?.parse::<u32>().ok()
+            })
+            .max()
+            .map(|tenths| tenths as f32 / 10.0)
     }
 
     fn pactl(kind: &str) -> Vec<PaDev> {
@@ -1299,13 +1605,18 @@ pub mod pulse {
                 if let Some(d) = cur.take() {
                     res.push(d);
                 }
-                cur = Some(PaDev { name: String::new(), desc: String::new(), channels: 2, rate: 48000 });
+                cur = Some(PaDev { name: String::new(), desc: String::new(), channels: 2, rate: 48000, api: String::new(), bluez_path: None });
                 continue;
             }
             let Some(d) = cur.as_mut() else { continue };
             let t = line.trim();
+            let prop = |key: &str| t.strip_prefix(key).and_then(|v| v.strip_prefix(" = ")).map(|v| v.trim_matches('"').to_string());
             if let Some(v) = t.strip_prefix("Name: ") {
                 d.name = v.to_string();
+            } else if let Some(v) = prop("device.api") {
+                d.api = v;
+            } else if let Some(v) = prop("api.bluez5.path") {
+                d.bluez_path = Some(v);
             } else if let Some(v) = t.strip_prefix("Description: ") {
                 d.desc = v.to_string();
             } else if let Some(v) = t.strip_prefix("Sample Specification: ") {
@@ -1337,7 +1648,19 @@ pub mod pulse {
             .collect();
         let outputs = pactl("sinks")
             .into_iter()
-            .map(|d| DeviceInfo { id: format!("pulse:{}", d.name), label: format!("PipeWire · {}", d.desc), channels: d.channels.min(8), kind: DevKind::guess(&d.name), ..Default::default() })
+            .map(|d| {
+                let id = format!("pulse:{}", d.name);
+                // MultiAudio's own output (and the loopback card it is made of)
+                let own = super::is_own_device(&id) || d.name.contains("snd_aloop");
+                let latency_ms = match d.api.as_str() {
+                    _ if own => None,
+                    "bluez5" => d.bluez_path.as_deref().and_then(bluez_delay_ms),
+                    "alsa" => Some(ALSA_LATENCY_MS),
+                    _ => None,
+                };
+                let kind = if own { DevKind::Virtual } else { DevKind::guess(&d.name) };
+                DeviceInfo { id, label: format!("PipeWire · {}", d.desc), channels: d.channels.min(8), kind, latency_ms }
+            })
             .collect();
         (inputs, outputs)
     }
@@ -1399,7 +1722,13 @@ pub mod pulse {
                 minreq: bytes,
                 fragsize: bytes,
             };
-            let s = match Simple::new(None, "MultiAudio", dir, Some(&name), "MultiAudio", &spec, None, Some(&attr)) {
+            // The engine's channel order (L R C LFE Ls Rs; quad L R Ls Rs) is
+            // WAVEFORMATEXTENSIBLE's. Without a map PulseAudio uses AIFF's, and
+            // the stereo right of a 5.1 sink arrives as LFE (2026-11-28: the rear
+            // speakers stayed silent, stereo taken for 5.1).
+            let mut map = libpulse_binding::channelmap::Map::default();
+            map.init_extend(fmt.channels as u8, libpulse_binding::channelmap::MapDef::WAVEEx);
+            let s = match Simple::new(None, "MultiAudio", dir, Some(&name), "MultiAudio", &spec, Some(&map), Some(&attr)) {
                 Ok(s) => {
                     let _ = tx.send(Ok(()));
                     s

@@ -31,6 +31,35 @@
 
 Su Mac servono i permessi **Registrazione audio di sistema**, **Microfono** (calibrazione) e **Accessibilità** (tasti del volume): l'app li chiede da sola.
 
+### Linux
+
+Come su Mac, acceso rende **«MultiAudio»** l'uscita di sistema e suona tutte le uscite, ognuna con posizione e ritardo. Perché i player ritardino il video, l'uscita deve dichiarare la sua latenza: un'uscita virtuale di PipeWire non può farlo, la porta di una scheda audio sì. Per questo «MultiAudio» è la scheda loopback del kernel (`snd-aloop`), da preparare una volta:
+
+```bash
+echo snd-aloop | sudo tee /etc/modules-load.d/snd-aloop.conf
+echo "options snd-aloop pcm_substreams=1" | sudo tee /etc/modprobe.d/snd-aloop.conf
+sudo modprobe snd-aloop
+```
+
+e la regola di WirePlumber che le dà il nome che MultiAudio cerca, in `~/.config/wireplumber/wireplumber.conf.d/60-multiaudio-loopback.conf`:
+
+```
+monitor.alsa.rules = [
+  { matches = [ { device.name = "~alsa_card.platform-snd_aloop.*" } ]
+    actions = { update-props = { device.description = "MultiAudio" } } }
+  { matches = [ { node.name = "~alsa_output.platform-snd_aloop.*" } ]
+    actions = { update-props = { node.name = "multiaudio_51", node.description = "MultiAudio",
+                                 priority.session = 1, priority.driver = 1,
+                                 session.suspend-timeout-seconds = 0 } } }
+  { matches = [ { node.name = "~alsa_input.platform-snd_aloop.*" } ]
+    actions = { update-props = { node.disabled = true } } }
+]
+```
+
+poi `systemctl --user restart wireplumber`. Senza, «MultiAudio» c'è lo stesso ma non dichiara la latenza: il video può andare avanti all'audio. La latenza delle casse Bluetooth è quella che dichiarano a BlueZ; le uscite col filo partono da circa 20 ms: la calibrazione col microfono misura quella vera.
+
+Su Linux MultiAudio sta anche nella **barra di sistema** (icona con menu: acceso/spento, uscite, apri, avvio all'accesso, esci); chiudere la finestra non lo spegne.
+
 ## Compilazione
 
 Serve [Rust](https://rustup.rs).

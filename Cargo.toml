@@ -61,6 +61,8 @@ objc2-foundation = "0.3"
 windows = { version = "0.62", features = ["Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_System_Com"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# icon and menu in the system tray (StatusNotifierItem over D-Bus, no GTK)
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
 libpulse-binding = "2.28"
 libpulse-simple-binding = "2.28"
 

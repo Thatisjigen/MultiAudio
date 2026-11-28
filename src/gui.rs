@@ -148,7 +148,24 @@ fn gain_of(o: &OutputConfig) -> f32 {
 // App
 // ---------------------------------------------------------------------------
 
+#[cfg(not(target_os = "linux"))]
 pub fn run() -> anyhow::Result<()> {
+    run_window()
+}
+
+/// Linux: the window, with MultiAudio in the tray when there is one.
+#[cfg(target_os = "linux")]
+pub fn run() -> anyhow::Result<()> {
+    run_linux(false)
+}
+
+/// Linux: only in the tray, no window (start at login).
+#[cfg(target_os = "linux")]
+pub fn run_in_tray() -> anyhow::Result<()> {
+    run_linux(true)
+}
+
+fn native_options() -> eframe::NativeOptions {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("MultiAudio")
         .with_inner_size([820.0, 760.0])
@@ -156,16 +173,195 @@ pub fn run() -> anyhow::Result<()> {
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png")) {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    // Wayland/X11: lets the desktop match the window to multiaudio.desktop
+    #[cfg(target_os = "linux")]
+    {
+        viewport = viewport.with_app_id("multiaudio");
+    }
+    eframe::NativeOptions { viewport, ..Default::default() }
+}
+
+/// The window alone: closing it quits.
+fn run_window() -> anyhow::Result<()> {
     eframe::run_native(
         "MultiAudio",
-        options,
+        native_options(),
         Box::new(|cc| {
             setup_style(&cc.egui_ctx);
             Ok(Box::new(App::new()))
         }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux(hidden: bool) -> anyhow::Result<()> {
+    if crate::tray::open_running_instance() {
+        println!("MultiAudio è già acceso: apro la sua finestra.");
+        return Ok(());
+    }
+    match crate::tray::Tray::spawn(hidden) {
+        Some(tray) => run_with_tray(tray, hidden),
+        None => run_window(),
+    }
+}
+
+/// Linux: the app lives in the tray; the window comes and goes. With the
+/// window closed the same work goes on without drawing.
+#[cfg(target_os = "linux")]
+fn run_with_tray(tray: crate::tray::Tray, hidden: bool) -> anyhow::Result<()> {
+    use crate::tray::Cmd;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    let app = Rc::new(RefCell::new(App::new()));
+    let tray = Rc::new(RefCell::new(tray));
+    let quit = Rc::new(Cell::new(false));
+    let mut show = !hidden;
+    let mut told = false;
+    loop {
+        if show {
+            show = false;
+            let window = InTray { app: app.clone(), tray: tray.clone(), quit: quit.clone() };
+            eframe::run_native(
+                "MultiAudio",
+                native_options(),
+                Box::new(move |cc| {
+                    setup_style(&cc.egui_ctx);
+                    Ok(Box::new(window))
+                }),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if quit.get() {
+                break;
+            }
+            crate::diag::log("finestra chiusa: resta nella barra");
+            if !told {
+                told = true;
+                crate::tray::notify("MultiAudio resta nella barra", "Per chiuderlo del tutto: «Esci» nel suo menu.");
+            }
+        }
+        {
+            let mut a = app.borrow_mut();
+            let mut t = tray.borrow_mut();
+            while let Some(cmd) = t.try_recv() {
+                match cmd {
+                    Cmd::Open => show = true,
+                    Cmd::Quit => quit.set(true),
+                    other => a.tray_command(other),
+                }
+            }
+            if quit.get() {
+                break;
+            }
+            let plan = a.before_frame();
+            a.after_frame(&plan);
+            t.show(a.tray_snapshot());
+        }
+        if !show {
+            std::thread::sleep(Duration::from_millis(60));
+        }
+    }
+    crate::diag::log("chiusura dall'icona nella barra");
+    tray.borrow().release();
+    app.borrow_mut().shutdown();
+    Ok(())
+}
+
+/// Linux: the window while MultiAudio lives in the tray. Closing it does
+/// not stop anything.
+#[cfg(target_os = "linux")]
+struct InTray {
+    app: std::rc::Rc<std::cell::RefCell<App>>,
+    tray: std::rc::Rc<std::cell::RefCell<crate::tray::Tray>>,
+    quit: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+#[cfg(target_os = "linux")]
+impl eframe::App for InTray {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        use crate::tray::Cmd;
+        let mut app = self.app.borrow_mut();
+        let mut tray = self.tray.borrow_mut();
+        while let Some(cmd) = tray.try_recv() {
+            match cmd {
+                Cmd::Open => ctx.send_viewport_cmd(egui::ViewportCommand::Focus),
+                Cmd::Quit => {
+                    self.quit.set(true);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                other => app.tray_command(other),
+            }
+        }
+        eframe::App::update(&mut *app, ctx, frame);
+        tray.show(app.tray_snapshot());
+    }
+    // (no on_exit: the app keeps running; «Esci» shuts it down in run_with_tray)
+}
+
+#[cfg(target_os = "linux")]
+impl App {
+    /// «MultiAudio» stays among the system's outputs while MultiAudio is off
+    /// (it is a sound card), so picking an output in the desktop's audio menu
+    /// is the switch: another one switches MultiAudio off, «MultiAudio»
+    /// switches it on. (Left playing, the engine heard nothing and its
+    /// outputs drifted: switching back sounded broken, 2026-11-28.)
+    /// Returns whether it switched MultiAudio on or off.
+    fn follow_system_choice(&mut self) -> bool {
+        let sys = self.system_output.clone();
+        let ours = sys.as_deref().is_some_and(backend::is_own_device);
+        if self.want_running && self.vout.is_some() && !ours {
+            if let Some(s) = &sys {
+                crate::diag::log(format!("scelta dal sistema l'uscita «{}»: spengo", backend::display_name(s)));
+                self.notice = Some((format!("Hai scelto «{}» come uscita: MultiAudio è spento.", backend::display_name(s)), Instant::now()));
+                self.set_running(false);
+                return true;
+            }
+        } else if !self.want_running && ours && self.cfg.outputs.iter().any(|o| o.enabled) {
+            crate::diag::log("scelta dal sistema l'uscita «MultiAudio»: accendo");
+            self.set_running(true);
+            return true;
+        }
+        false
+    }
+
+    fn tray_snapshot(&self) -> crate::tray::Snapshot {
+        use crate::tray::OutputItem;
+        let mut outputs = Vec::new();
+        for d in &self.devices.outputs {
+            let enabled = self.cfg.outputs.iter().any(|o| o.id == d.id && o.enabled);
+            // the outputs PipeWire shows; raw ALSA devices and virtual ones only if in use
+            if !enabled && (backend::is_own_device(&d.id) || d.kind == DevKind::Virtual || !d.id.starts_with("pulse:")) {
+                continue;
+            }
+            // (they are all PipeWire's: no need to say so)
+            let name = d.label.strip_prefix("PipeWire · ").unwrap_or(&d.label).to_string();
+            outputs.push(OutputItem { id: d.id.clone(), name, enabled, connected: true });
+        }
+        for o in &self.cfg.outputs {
+            if self.devices.output(&o.id).is_none() {
+                outputs.push(OutputItem { id: o.id.clone(), name: o.name.clone(), enabled: o.enabled, connected: false });
+            }
+        }
+        crate::tray::Snapshot { running: self.want_running, outputs, autostart: crate::tray::autostart_enabled() }
+    }
+
+    fn tray_command(&mut self, cmd: crate::tray::Cmd) {
+        use crate::tray::Cmd;
+        match cmd {
+            Cmd::SetRunning(on) => self.set_running(on),
+            Cmd::ToggleOutput(id) => {
+                let on = !self.cfg.outputs.iter().any(|o| o.id == id && o.enabled);
+                let name = self.devices.output(&id).map(|d| d.label.clone()).unwrap_or_default();
+                self.set_output_enabled(&id, &name, on);
+            }
+            Cmd::SetAutostart(on) => {
+                if let Err(e) = crate::tray::set_autostart(on) {
+                    self.push_log(format!("Avvio all'accesso: {e}"));
+                }
+            }
+            Cmd::Open | Cmd::Quit => {}
+        }
+    }
 }
 
 /// How long after the engine closed MultiAudio's own output is made or
@@ -500,6 +696,26 @@ impl App {
         }
     }
 
+    /// The power switch (window header; Linux: also the tray menu).
+    fn set_running(&mut self, on: bool) {
+        self.want_running = on;
+        crate::diag::log(if on { "acceso dall'utente" } else { "spento dall'utente" });
+        if on {
+            self.start_engine();
+        } else {
+            self.stop_engine();
+        }
+    }
+
+    /// An output's switch (its card; Linux: also the tray menu).
+    fn set_output_enabled(&mut self, id: &str, name: &str, on: bool) {
+        match self.cfg.outputs.iter().position(|o| o.id == id) {
+            Some(i) => self.cfg.outputs[i].enabled = on,
+            None if on => self.cfg.outputs.push(OutputConfig { id: id.to_string(), name: name.to_string(), enabled: true, ..Default::default() }),
+            None => {}
+        }
+    }
+
     fn stop_engine(&mut self) {
         self.remove_vout(); // the previous system output comes back
         self.system_output = backend::default_output_id();
@@ -551,7 +767,8 @@ impl App {
         if self.last_poll.elapsed() > Duration::from_secs(2) {
             self.last_poll = now;
             let sys = backend::default_output_id();
-            if sys != self.system_output {
+            let changed = sys != self.system_output;
+            if changed {
                 crate::diag::log(format!(
                     "uscita di sistema: {} → {}",
                     self.system_output.as_deref().map(backend::display_name).unwrap_or_default(),
@@ -559,7 +776,15 @@ impl App {
                 ));
             }
             self.system_output = sys;
-            if self.want_running {
+            // (switched on or off by that choice: `plan` is from before it)
+            #[cfg(target_os = "linux")]
+            let acted = changed && self.follow_system_choice();
+            #[cfg(not(target_os = "linux"))]
+            let acted = {
+                let _ = changed;
+                false
+            };
+            if self.want_running && !acted {
                 if let Some(wanted) = plan.system_output.clone() {
                     self.guard_output(&wanted);
                 }
@@ -938,13 +1163,7 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let mut on = self.want_running;
                 if switch(ui, &mut on, egui::vec2(64.0, 34.0)).changed() {
-                    self.want_running = on;
-                    crate::diag::log(if on { "acceso dall'utente" } else { "spento dall'utente" });
-                    if on {
-                        self.start_engine();
-                    } else {
-                        self.stop_engine();
-                    }
+                    self.set_running(on);
                 }
                 if volume::active() && self.engine.is_some() {
                     ui.add_space(18.0);
@@ -1030,7 +1249,9 @@ impl App {
                     .color(WARN),
             );
         }
+        // (macOS: the Bluetooth clock; Linux's output does not depend on it)
         let bt_video = backend::VOUT_IS_SYSTEM
+            && cfg!(target_os = "macos")
             && plan.main.as_deref().and_then(|m| self.devices.output(m)).map(|d| d.kind == DevKind::Bluetooth).unwrap_or(false);
         if self.bt_clock_tripped && !self.cfg.bt_surround {
             ui.label(
@@ -1132,10 +1353,7 @@ impl App {
             ui.horizontal(|ui| {
                 let mut on = enabled;
                 if dev.is_some() && switch(ui, &mut on, egui::vec2(44.0, 24.0)).changed() {
-                    match idx {
-                        Some(i) => self.cfg.outputs[i].enabled = on,
-                        None => self.cfg.outputs.push(OutputConfig { id: id.to_string(), name: name.clone(), enabled: true, ..Default::default() }),
-                    }
+                    self.set_output_enabled(id, &name, on);
                 }
                 ui.label(RichText::new(kind.icon()).size(18.0));
                 ui.label(RichText::new(&name).size(17.0).strong().color(if enabled { TEXT } else { DIM }));
@@ -1500,7 +1718,7 @@ impl App {
                 ui.label("");
                 ui.checkbox(&mut self.cfg.autostart, "Accendi all'apertura dell'app");
                 ui.end_row();
-                if backend::VOUT_IS_SYSTEM && backend::vout_supported() {
+                if backend::VOUT_IS_SYSTEM && cfg!(target_os = "macos") && backend::vout_supported() {
                     ui.label("");
                     let before = self.cfg.bt_surround;
                     ui.checkbox(&mut self.cfg.bt_surround, "5.1 vero anche con il video sul Bluetooth").on_hover_text(
@@ -1608,8 +1826,10 @@ impl App {
     }
 }
 
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl App {
+    /// The work of a frame before drawing it (Linux: also done with the
+    /// window closed, MultiAudio in the tray). Returns the plan to draw.
+    fn before_frame(&mut self) -> Plan {
         let plan = self.plan();
         self.housekeeping(&plan);
         if volume::active() {
@@ -1632,6 +1852,19 @@ impl eframe::App for App {
             self.last_signal = Instant::now();
         }
         self.input_meter = (self.input_meter * 0.85).max(level(p));
+        plan
+    }
+
+    /// The work of a frame after drawing it.
+    fn after_frame(&mut self, plan: &Plan) {
+        self.push_live_params(plan);
+        self.autosave();
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let plan = self.before_frame();
 
         egui::TopBottomPanel::top("header")
             .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(20, 14)))
@@ -1649,8 +1882,7 @@ impl eframe::App for App {
                     ui.add_space(10.0);
                 });
             });
-        self.push_live_params(&plan);
-        self.autosave();
+        self.after_frame(&plan);
         ctx.request_repaint_after(Duration::from_millis(60));
     }
 
@@ -1732,7 +1964,14 @@ L'uscita «MultiAudio» dichiara la latenza dell'uscita più lenta: i player rit
 I ritardi partono stimati dalla latenza dichiarata dai dispositivi («auto»); «Calibra col microfono» li misura davvero, e misura anche quanto suona forte ogni uscita (serve al surround).
 Il volume: i tasti del computer alzano e abbassano tutte le uscite insieme; il cursore Volume di ogni uscita la regola rispetto alle altre. MultiAudio muove il volume dei dispositivi che lo hanno e regola da sé gli altri.";
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+const HELP: &str = "\
+Come funziona: quando è acceso, MultiAudio fa diventare «MultiAudio» l'uscita di sistema: tutto quello che suona il computer (anche il 5.1 dei film) arriva lì, e MultiAudio lo manda alle uscite accese, ognuna col suo ritardo e la sua posizione. Quando lo spegni torna l'uscita di prima.
+L'uscita «MultiAudio» dichiara la latenza dell'uscita più lenta: i player ritardano il video da soli. Serve il modulo del kernel snd-aloop (vedi README): senza, l'uscita c'è lo stesso ma non dichiara la latenza e il video può andare avanti all'audio.
+I ritardi partono stimati («auto»: il Bluetooth dal ritardo che dichiara la cassa, le uscite col filo circa 20 ms); «Calibra col microfono» li misura davvero, e misura anche quanto suona forte ogni uscita (serve al surround).
+Il volume: i tasti del computer alzano e abbassano tutte le uscite insieme; il cursore Volume di ogni uscita la regola rispetto alle altre.";
+
+#[cfg(target_os = "windows")]
 const HELP: &str = "\
 Come funziona: MultiAudio cattura da sé l'audio del computer (nessun driver da installare) e lo manda alle uscite accese, ognuna col suo ritardo.
 L'uscita più lenta (di solito Bluetooth o AirPlay) diventa l'uscita di sistema: i player leggono la sua latenza e ritardano il video da soli, anche Netflix & co.

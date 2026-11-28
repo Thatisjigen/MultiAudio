@@ -620,6 +620,36 @@ fn follow_device(slider: f32, own: f32) -> f32 {
     }
 }
 
+/// Linux: the volume of «MultiAudio» (what the volume keys and the
+/// desktop's slider move) and MultiAudio's own volume are one: a change on
+/// either side is copied to the other. At the start MultiAudio's wins.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct VoutVolume {
+    /// what «MultiAudio» had when last looked at (or set)
+    seen: Option<(f32, bool)>,
+    /// MultiAudio's volume generation copied to it last
+    gen: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+impl VoutVolume {
+    fn sync(&mut self) {
+        let Some(now) = backend::linux_vout::volume() else { return };
+        let (level, muted, gen) = crate::volume::get();
+        if self.seen.is_some_and(|s| (s.0 - now.0).abs() > 0.004 || s.1 != now.1) {
+            crate::diag::log(format!("volume: «MultiAudio» portato da fuori a {}{}", pct(now.0), if now.1 { " (muto)" } else { "" }));
+            crate::volume::set(now.0, now.1);
+            self.gen = Some(crate::volume::get().2);
+            self.seen = Some(now);
+        } else if self.gen != Some(gen) {
+            backend::linux_vout::set_volume(level, muted);
+            self.gen = Some(gen);
+            self.seen = backend::linux_vout::volume().or(Some(now));
+        }
+    }
+}
+
 impl OwnVolume {
     /// `sound`: sound is coming out (the source is above −60 dBFS).
     fn tick(&mut self, routes: &[MonRoute], own_is_system: bool, sound: bool) {
@@ -812,20 +842,28 @@ impl Monitor {
                 let mut owners: Vec<Option<Vec<i32>>> = vec![None; inputs.len()];
                 let mut long_quiet: Vec<bool> = vec![false; inputs.len()];
                 let mut own = OwnVolume::default();
+                #[cfg(target_os = "linux")]
+                let mut vout_volume = VoutVolume::default();
                 let mut seen_in: Vec<(u32, u32)> = vec![(0, 0); inputs.len()];
                 let mut seen_torn: Vec<(u32, u64, u64)> = vec![(0, 0, 0); inputs.len()];
                 let mut seen_out: Vec<u32> = vec![0; routes.len()];
                 let mut was_discrete = false;
                 while !st.load(Relaxed) {
-                    if tick.is_multiple_of(vol_every) && cfg!(target_os = "macos") {
+                    // macOS, and Linux while «MultiAudio» is the system output:
+                    // the volume is MultiAudio's (keys included), applied to
+                    // each output's device
+                    let own_is_system = tick.is_multiple_of(vol_every) && backend::system_output_is_vout();
+                    if tick.is_multiple_of(vol_every) && (cfg!(target_os = "macos") || (cfg!(target_os = "linux") && own_is_system)) {
                         // the volume is MultiAudio's (keys included) while it is on
                         crate::volume::set_active(true);
+                        #[cfg(target_os = "linux")]
+                        vout_volume.sync();
                         let now = now_ns();
                         let sound = inputs.iter().any(|i| {
                             let loud = i.last_loud_ns.load(Relaxed);
                             loud > 0 && now.saturating_sub(loud) < 300_000_000
                         });
-                        own.tick(&routes, backend::system_output_is_vout(), sound);
+                        own.tick(&routes, own_is_system, sound);
                     } else if tick.is_multiple_of(vol_every) {
                         if let Some(v) = backend::system_volume() {
                             let dev = backend::physical_key(&v.device);

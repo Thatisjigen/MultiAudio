@@ -15,6 +15,8 @@ mod machud;
 mod mackeys;
 mod plan;
 mod record;
+#[cfg(target_os = "linux")]
+mod tray;
 mod volume;
 #[cfg(target_os = "windows")]
 mod winvol;
@@ -78,27 +80,38 @@ fn main() -> anyhow::Result<()> {
         }
         Some("--help") | Some("-h") => {
             println!(
-                "MultiAudio {}\n\n  multiaudio              interfaccia grafica\n  multiaudio --list       elenca i dispositivi (id da usare nel config)\n  multiaudio --headless   esegue il config salvato senza interfaccia\n  multiaudio --config-path  mostra dove si trova il config\n  multiaudio --cleanup    dopo un crash: toglie l'uscita MultiAudio e rimette quella di prima\n\nVariabile MULTIAUDIO_CONFIG per usare un altro file di configurazione.",
-                env!("CARGO_PKG_VERSION")
+                "MultiAudio {}\n\n  multiaudio              interfaccia grafica\n{}  multiaudio --list       elenca i dispositivi (id da usare nel config)\n  multiaudio --headless   esegue il config salvato senza interfaccia\n  multiaudio --config-path  mostra dove si trova il config\n  multiaudio --cleanup    dopo un crash: toglie l'uscita MultiAudio e rimette quella di prima\n\nVariabile MULTIAUDIO_CONFIG per usare un altro file di configurazione.",
+                env!("CARGO_PKG_VERSION"),
+                if cfg!(target_os = "linux") { "  multiaudio --tray       solo nella barra di sistema, senza finestra\n" } else { "" }
             );
             Ok(())
         }
-        _ => {
-            #[cfg(unix)]
-            {
-                stop_on_signals();
-                // the window may be closed or busy: act from a thread
-                std::thread::spawn(|| loop {
-                    if STOP.load(Relaxed) {
-                        backend::emergency_restore();
-                        std::process::exit(0);
-                    }
-                    std::thread::sleep(Duration::from_millis(200));
-                });
-            }
-            gui::run()
-        }
+        #[cfg(target_os = "linux")]
+        Some("--tray") => run_gui(true),
+        _ => run_gui(false),
     }
+}
+
+/// The window (Linux: `tray_only`, only the tray icon until it is opened).
+fn run_gui(tray_only: bool) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        stop_on_signals();
+        // the window may be closed or busy: act from a thread
+        std::thread::spawn(|| loop {
+            if STOP.load(Relaxed) {
+                backend::emergency_restore();
+                std::process::exit(0);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        });
+    }
+    #[cfg(target_os = "linux")]
+    if tray_only {
+        return gui::run_in_tray();
+    }
+    let _ = tray_only;
+    gui::run()
 }
 
 fn list() -> anyhow::Result<()> {
